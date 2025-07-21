@@ -1,0 +1,1 @@
+  -c "from src.models.expansionnet_inference import InferenceExpansionNet; model = InferenceExpansionNet(); print('Has method:', hasattr(model, 'estimate_layer_complexity'))"
