@@ -14,34 +14,48 @@ class StaticSplittingStrategy:
         self.layer_complexities = model.estimate_layer_complexity()
     
     def even_split(self, num_devices: int, device_types: List[str] = None) -> SplitConfiguration:
-        """Split layers evenly across devices"""
+        """Fixed even split respecting encoder-decoder boundaries"""
         if device_types is None:
             device_types = ['edge'] * num_devices
         
-        layers_per_device = self.total_layers // num_devices
-        remaining_layers = self.total_layers % num_devices
-        
         assignments = []
+        
+        # Ensure encoder completion on one device
+        encoder_devices = max(1, num_devices - 1)  # Reserve last device for decoder
+        encoder_layers_per_device = self.model.N_enc // encoder_devices
+        
         current_layer = 0
         
-        for i in range(num_devices):
-            # Distribute remaining layers to first devices
-            device_layers = layers_per_device + (1 if i < remaining_layers else 0)
+        # Distribute encoder layers
+        for i in range(encoder_devices):
+            if i == encoder_devices - 1:  # Last encoder device gets remaining layers
+                end_layer = self.model.N_enc - 1
+            else:
+                end_layer = current_layer + encoder_layers_per_device - 1
             
             assignments.append(DeviceAssignment(
                 device_id=i,
                 layer_start=current_layer,
-                layer_end=current_layer + device_layers - 1,
+                layer_end=end_layer,
                 device_type=device_types[i]
             ))
-            
-            current_layer += device_layers
+            current_layer = end_layer + 1
+        
+        # Assign all decoder layers to last device
+        if num_devices > encoder_devices:
+            assignments.append(DeviceAssignment(
+                device_id=encoder_devices,
+                layer_start=self.model.N_enc,
+                layer_end=self.total_layers - 1,
+                device_type=device_types[encoder_devices] if encoder_devices < len(device_types) else 'server'
+            ))
         
         return SplitConfiguration(
             device_assignments=assignments,
-            total_devices=num_devices,
-            strategy='even_split'
+            total_devices=len(assignments),
+            strategy='even_split_fixed'
         )
+
     
     def capability_weighted_split(self, device_capabilities: List[float]) -> SplitConfiguration:
         """Split based on device computational capabilities"""

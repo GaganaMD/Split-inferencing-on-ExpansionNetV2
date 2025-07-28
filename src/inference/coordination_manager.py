@@ -175,6 +175,150 @@ class InferenceCoordinator:
             'total_pipeline_time': total_time
         }
     
+    def execute_pipeline(self, model, split_config: SplitConfiguration, images: torch.Tensor, captions: torch.Tensor,
+                         device_capabilities: Dict, network_conditions: tuple,
+                    debug_mode: bool = True) -> Dict[str, Any]:
+        """Execute pipeline with enhanced debugging"""
+        
+        device_results = {}
+        communication_times = {}
+        total_data_transferred = 0
+        
+        # Debug: Track tensor flow
+        tensor_flow_log = []
+        
+        # Prepare initial data
+        pipeline_data = {
+            'images': images,
+            'captions': captions
+        }
+        
+        if debug_mode:
+            print(f" DEBUG: Initial pipeline data keys: {list(pipeline_data.keys())}")
+            print(f" DEBUG: Images shape: {images.shape}")
+            print(f" DEBUG: Captions shape: {captions.shape}")
+        
+        try:
+            # Execute pipeline sequentially with debugging
+            for i, assignment in enumerate(split_config.device_assignments):
+                device_id = assignment.device_id
+                
+                if debug_mode:
+                    print(f"\n📱 Device {device_id} (layers {assignment.layer_start}-{assignment.layer_end}):")
+                    print(f"   Input keys: {list(pipeline_data.keys())}")
+                    for key, tensor in pipeline_data.items():
+                        if isinstance(tensor, torch.Tensor):
+                            print(f"   {key} shape: {tensor.shape}")
+                
+                # Device processing with debugging
+                device_start_time = time.time()
+                
+                with torch.no_grad():
+                    device_output = model.forward_device_segment(
+                        device_id, pipeline_data, split_config
+                    )
+                
+                device_processing_time = time.time() - device_start_time
+                
+                # Debug: Log device output
+                if debug_mode:
+                    print(f"   Output keys: {list(device_output.keys())}")
+                    for key, tensor in device_output.items():
+                        if isinstance(tensor, torch.Tensor):
+                            print(f"   {key} shape: {tensor.shape}")
+                    
+                    # Critical check for encoder completion
+                    if 'encoder_complete' in device_output:
+                        print(f"   ✅ ENCODER COMPLETE found on device {device_id}")
+                        print(f"   Shape: {device_output['encoder_complete'].shape}")
+                    else:
+                        print(f"   ⚠️  No encoder_complete from device {device_id}")
+                
+                # Store results with debugging info
+                device_results[device_id] = {
+                    'processing_time': device_processing_time,
+                    'output_keys': list(device_output.keys()),
+                    'assignment': assignment,
+                    'debug_info': {
+                        'had_encoder_complete': 'encoder_complete' in device_output,
+                        'had_decoder_output': 'decoder_output' in device_output,
+                        'had_final_logits': 'final_logits' in device_output
+                    }
+                }
+                
+                # Log tensor flow for debugging
+                tensor_flow_log.append({
+                    'device_id': device_id,
+                    'input_keys': list(pipeline_data.keys()),
+                    'output_keys': list(device_output.keys()),
+                    'encoder_complete_present': 'encoder_complete' in device_output
+                })
+                
+                # Communication simulation and debugging
+                if i < len(split_config.device_assignments) - 1:
+                    next_device = split_config.device_assignments[i + 1].device_id
+                    
+                    # Extract transfer data
+                    transfer_data = self._extract_transfer_data(device_output)
+                    data_size = self._estimate_data_size(transfer_data)
+                    
+                    if debug_mode:
+                        print(f"   📡 Transferring to device {next_device}: {list(transfer_data.keys())}")
+                        print(f"   Data size: {data_size:.2f} MB")
+                    
+                    # Simulate communication delay
+                    comm_time = self._simulate_communication_delay(
+                        data_size, device_id, next_device, network_conditions
+                    )
+                    
+                    communication_times[(device_id, next_device)] = comm_time
+                    total_data_transferred += data_size
+                
+                # Update pipeline data for next device
+                pipeline_data.update(device_output)
+                
+                if debug_mode:
+                    print(f"   Updated pipeline data keys: {list(pipeline_data.keys())}")
+            
+            # Final debugging check
+            final_logits = pipeline_data.get('final_logits')
+            if debug_mode:
+                print(f"\n Final Results:")
+                print(f"   Final logits present: {final_logits is not None}")
+                if final_logits is not None:
+                    print(f"   Final logits shape: {final_logits.shape}")
+                print(f"   Final pipeline keys: {list(pipeline_data.keys())}")
+            
+            # Calculate metrics with debugging
+            metrics = self._calculate_performance_metrics(
+                device_results, communication_times, total_data_transferred,
+                final_logits, captions
+            )
+            
+            # Add debugging information to results
+            return {
+                'final_logits': final_logits,
+                'device_results': device_results,
+                'communication_times': communication_times,
+                'total_data_transferred': total_data_transferred,
+                'metrics': metrics,
+                'success': True,
+                'debug_info': {
+                    'tensor_flow_log': tensor_flow_log,
+                    'encoder_complete_devices': [
+                        log['device_id'] for log in tensor_flow_log 
+                        if log['encoder_complete_present']
+                    ]
+                }
+            }
+            
+        except Exception as e:
+            print(f"❌ Pipeline execution failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return self._fallback_single_device(model, images, captions)
+
+    
     def _fallback_single_device(self, model, images: torch.Tensor, 
                                captions: torch.Tensor) -> Dict[str, Any]:
         """Fallback to single device inference"""

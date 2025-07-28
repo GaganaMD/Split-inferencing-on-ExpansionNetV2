@@ -132,9 +132,12 @@ class InferenceExpansionNet(nn.Module):
             complexities.append(total_ops)
         
         return complexities
-    def forward_device_segment(self, device_id: int, input_data: Dict[str, torch.Tensor], split_config: SplitConfiguration) -> Dict[str, torch.Tensor]:
+    
+
+    def forward_device_segment(self, device_id: int, input_data: Dict[str, torch.Tensor],
+                          split_config: SplitConfiguration) -> Dict[str, torch.Tensor]:
         """
-        Execute forward pass for a specific device segment
+        Execute forward pass for a specific device segment with enhanced validation and debugging
         """
         # Find this device's assignment
         assignment = None
@@ -147,6 +150,23 @@ class InferenceExpansionNet(nn.Module):
             raise ValueError(f"No assignment found for device {device_id}")
         
         output_data = {}
+        
+        # ENHANCED VALIDATION: Check for invalid layer boundary splits
+        is_processing_encoder = assignment.layer_start < self.N_enc
+        is_processing_decoder = assignment.layer_end >= self.N_enc
+        
+        if is_processing_encoder and is_processing_decoder:
+            # Mixed processing: validate encoder completion
+            encoder_end = min(self.N_enc, assignment.layer_end + 1)
+            if encoder_end == self.N_enc:
+                print(f"✅ Device {device_id}: Valid mixed processing with encoder completion")
+            else:
+                print(f"⚠️  Device {device_id}: Invalid mixed processing - encoder incomplete ({encoder_end}/{self.N_enc})")
+                print(f"   This may cause decoder processing failures due to missing encoder_complete")
+        
+        # Boundary validation warnings
+        if assignment.layer_start >= self.N_enc and 'encoder_complete' not in input_data and 'encoder_output' not in input_data:
+            print(f"❌ Device {device_id}: Decoder-only device without encoder memory - will fail!")
         
         # Visual encoding (device 0 only) - FIX: Handle tensor dimensions properly
         if device_id == 0 and 'images' in input_data:
@@ -167,8 +187,10 @@ class InferenceExpansionNet(nn.Module):
             
             output_data['visual_features'] = visual_features
             output_data['encoder_input'] = visual_features
+            
+            print(f" Device {device_id}: Visual features shape: {visual_features.shape}")
         
-        # Encoder processing - FIX: Handle tensor shapes consistently
+        # Encoder processing - CRITICAL: Proper encoder completion tracking
         if assignment.layer_start < self.N_enc:
             encoder_start = max(0, assignment.layer_start)
             encoder_end = min(self.N_enc, assignment.layer_end + 1)
@@ -179,22 +201,33 @@ class InferenceExpansionNet(nn.Module):
                 if encoder_input.dim() == 2:
                     encoder_input = encoder_input.unsqueeze(0)
                 
+                print(f" Device {device_id}: Processing encoder layers {encoder_start} to {encoder_end-1}")
+                print(f" Device {device_id}: Encoder input shape: {encoder_input.shape}")
+                
                 for i in range(encoder_start, encoder_end):
                     encoder_input = self.encoder_layers[i](encoder_input)
+                    print(f" Device {device_id}: After layer {i} shape: {encoder_input.shape}")
                 
                 output_data['encoder_output'] = encoder_input
                 
-                # Mark if encoder is complete
+                # CRITICAL: Mark encoder completion and ensure tensor is preserved
                 if encoder_end == self.N_enc:
-                    output_data['encoder_complete'] = encoder_input
+                    output_data['encoder_complete'] = encoder_input.clone()  # Clone to ensure persistence
+                    print(f"✅ Device {device_id}: ENCODER COMPLETE - shape: {encoder_input.shape}")
+                else:
+                    print(f" Device {device_id}: Encoder partial complete (end={encoder_end}/{self.N_enc})")
+            else:
+                print(f"❌ Device {device_id}: No encoder input available for encoder processing!")
         
-        # Decoder processing - FIX: Handle cross-attention properly
+        # Decoder processing - CRITICAL: Ensure encoder_complete is available
         decoder_start_layer = assignment.layer_start - self.N_enc
         decoder_end_layer = assignment.layer_end - self.N_enc
         
         if decoder_start_layer < self.N_dec and decoder_end_layer >= 0:
             dec_start = max(0, decoder_start_layer)
             dec_end = min(self.N_dec, decoder_end_layer + 1)
+            
+            print(f" Device {device_id}: Processing decoder layers {dec_start} to {dec_end-1}")
             
             # Initialize decoder if this is the first decoder device
             if dec_start == 0 and 'captions' in input_data:
@@ -204,37 +237,106 @@ class InferenceExpansionNet(nn.Module):
                 
                 token_embeddings = self.token_embedding(captions)
                 decoder_input = self.pos_encoding(token_embeddings)
+                print(f" Device {device_id}: Initialized decoder input shape: {decoder_input.shape}")
             elif 'decoder_output' in input_data:
                 decoder_input = input_data['decoder_output']
+                print(f" Device {device_id}: Received decoder input shape: {decoder_input.shape}")
             else:
                 decoder_input = None
+                print(f"⚠️ Device {device_id}: No decoder input available")
             
-            # Process decoder layers
+            # Process decoder layers - CRITICAL: Check for encoder memory
             if decoder_input is not None:
-                encoder_memory = input_data.get('encoder_complete', input_data.get('encoder_output'))
+                # Look for encoder memory - prioritize encoder_complete
+                encoder_memory = input_data.get('encoder_complete')
+                if encoder_memory is None:
+                    encoder_memory = input_data.get('encoder_output')
+                    if encoder_memory is not None:
+                        print(f"⚠️ Device {device_id}: Using encoder_output instead of encoder_complete (suboptimal)")
                 
+                print(f" Device {device_id}: Encoder memory available: {encoder_memory is not None}")
                 if encoder_memory is not None:
+                    print(f" Device {device_id}: Encoder memory shape: {encoder_memory.shape}")
+                    
                     # Ensure compatible dimensions for cross-attention
                     if encoder_memory.dim() == 2:
                         encoder_memory = encoder_memory.unsqueeze(0)
                     if decoder_input.dim() == 2:
                         decoder_input = decoder_input.unsqueeze(0)
                     
+                    # VALIDATION: Check tensor compatibility
+                    if encoder_memory.size(0) != decoder_input.size(0):
+                        print(f"❌ Device {device_id}: Batch size mismatch - encoder: {encoder_memory.size(0)}, decoder: {decoder_input.size(0)}")
+                        raise RuntimeError(f"Batch size mismatch between encoder and decoder on device {device_id}")
+                    
                     for i in range(dec_start, dec_end):
-                        decoder_input = self.decoder_layers[i](decoder_input, encoder_memory)
+                        print(f" Device {device_id}: Processing decoder layer {i}")
+                        try:
+                            decoder_input = self.decoder_layers[i](decoder_input, encoder_memory)
+                            print(f" Device {device_id}: After decoder layer {i} shape: {decoder_input.shape}")
+                        except Exception as e:
+                            print(f"❌ Device {device_id}: Decoder layer {i} failed: {e}")
+                            raise
                     
                     output_data['decoder_output'] = decoder_input
                     
                     # Generate final output if this is the last decoder device
                     if dec_end == self.N_dec:
-                        logits = self.output_projection(decoder_input)
-                        output_data['final_logits'] = logits
+                        try:
+                            logits = self.output_projection(decoder_input)
+                            output_data['final_logits'] = logits
+                            print(f"✅ Device {device_id}: FINAL LOGITS generated - shape: {logits.shape}")
+                        except Exception as e:
+                            print(f"❌ Device {device_id}: Final projection failed: {e}")
+                            raise
+                else:
+                    print(f"❌ Device {device_id}: No encoder memory available for decoder!")
+                    print(f"   Available keys: {list(input_data.keys())}")
+                    print(f"   This will cause decoder processing to fail")
+                    
+                    # Add diagnostic information
+                    if is_processing_decoder and not is_processing_encoder:
+                        print(f"   DIAGNOSTIC: Pure decoder device without encoder input")
+                        print(f"   SOLUTION: Ensure encoder_complete is transferred from previous device")
+            else:
+                print(f"❌ Device {device_id}: Decoder processing requested but no decoder input available")
+        
+        # Preserve encoder_complete for subsequent devices - CRITICAL for pipeline continuity
+        if 'encoder_complete' in input_data and 'encoder_complete' not in output_data:
+            output_data['encoder_complete'] = input_data['encoder_complete']
+            print(f"🔄 Device {device_id}: Preserving encoder_complete for next device")
+        
+        # VALIDATION: Final output validation
+        expected_outputs = []
+        if assignment.layer_start < self.N_enc:
+            expected_outputs.extend(['encoder_input', 'encoder_output'])
+            if assignment.layer_end >= self.N_enc - 1:
+                expected_outputs.append('encoder_complete')
+        
+        if assignment.layer_end >= self.N_enc:
+            if dec_start == 0 or 'decoder_output' in input_data:
+                expected_outputs.append('decoder_output')
+            if assignment.layer_end >= self.total_layers - 1:
+                expected_outputs.append('final_logits')
+        
+        # Check if critical outputs are missing
+        missing_outputs = [output for output in expected_outputs if output not in output_data]
+        if missing_outputs:
+            print(f"⚠️ Device {device_id}: Missing expected outputs: {missing_outputs}")
         
         # Add metadata
         output_data['device_id'] = device_id
         output_data['processing_complete'] = True
         
+        # Summary of device processing
+        print(f"  Device {device_id} Summary:")
+        print(f"   Assigned layers: {assignment.layer_start}-{assignment.layer_end}")
+        print(f"   Input keys: {list(input_data.keys())}")
+        print(f"   Output keys: {list(output_data.keys())}")
+        print(f"   Processing success: {'✅' if not missing_outputs else '⚠️'}")
+        
         return output_data
+
 
 
     

@@ -93,10 +93,10 @@ def main():
         except Exception as e:
             print(f"❌ Failed: {str(e)}")
     
-    print(f"\n📈 Strategy Test Results: {successful_strategies}/{len(strategies)} successful")
+    print(f"\n Strategy Test Results: {successful_strategies}/{len(strategies)} successful")
     
     # Generate caption example
-    print(f"\n🎯 Caption Generation Example:")
+    print(f"\n Caption Generation Example:")
     print("-" * 30)
     
     try:
@@ -113,7 +113,7 @@ def main():
         print(f"❌ Caption generation failed: {e}")
     
     # Performance statistics
-    print(f"\n📊 Performance Statistics:")
+    print(f"\n Performance Statistics:")
     print("-" * 25)
     
     try:

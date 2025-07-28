@@ -54,30 +54,6 @@ class MultiDeviceInferenceSystem:
         
         self.device_capabilities[device_id] = device_info
         print(f"Registered device {device_id} ({device_type}) with compute power {compute_power}")
-
-    def get_performance_stats(self) -> Dict[str, Any]:
-        """Get performance statistics"""
-        if not self.performance_history:
-            return {'message': 'No inference history available'}
-        
-        recent_history = self.performance_history[-50:]  # Last 50 inferences
-        
-        times = [record['total_time'] for record in recent_history]
-        device_counts = [record['split_config']['total_devices'] for record in recent_history]
-        
-        stats = {
-            'total_inferences': len(self.performance_history),
-            'recent_avg_time': np.mean(times) if times else 0,
-            'recent_std_time': np.std(times) if times else 0,
-            'avg_devices_used': np.mean(device_counts) if device_counts else 0,
-            'fastest_time': min(times) if times else 0,
-            'slowest_time': max(times) if times else 0,
-            'registered_devices': len(self.available_devices),
-            'strategies_used': list(set(record['split_config']['strategy'] for record in recent_history))
-        }
-        
-        return stats
-
     
     def set_network_conditions(self, bandwidths: List[float], latencies: List[float]):
         """Set network conditions between devices"""
@@ -156,8 +132,11 @@ class MultiDeviceInferenceSystem:
         return result
     
     def generate_caption(self, image: torch.Tensor, max_length: int = 20,
-                    temperature: float = 1.0, num_devices: int = None) -> List[int]:
-        """Generate caption using multi-device inference with proper tensor handling"""
+                        temperature: float = 1.0, num_devices: int = None) -> List[int]:
+        """
+        Generate caption using multi-device inference with strategy override
+        FIX 3: Force encoder-decoder split for caption generation
+        """
         batch_size = 1
         device = image.device
         
@@ -167,33 +146,133 @@ class MultiDeviceInferenceSystem:
         elif image.dim() == 5:
             image = image.squeeze(1).squeeze(1)  # Remove extra dimensions
         
-        # Start with BOS token
-        generated = torch.zeros(batch_size, max_length, dtype=torch.long, device=device)
-        generated[:, 0] = 1  # BOS token
+        # FIX 3: Override strategy for caption generation to ensure encoder completion
+        original_strategy = self.splitting_strategy
+        print(f"🔄 Caption generation: Overriding strategy from '{original_strategy}' to 'encoder_decoder'")
         
-        for i in range(1, max_length):
-            current_seq = generated[:, :i]
+        try:
+            # Start with BOS token
+            generated = torch.zeros(batch_size, max_length, dtype=torch.long, device=device)
+            generated[:, 0] = 1  # BOS token
             
-            # Perform inference
-            result = self.inference(
-                images=image,
-                captions=current_seq,
-                num_devices=num_devices
-            )
+            for i in range(1, max_length):
+                current_seq = generated[:, :i]
+                
+                # Perform inference with forced encoder-decoder strategy
+                result = self.inference(
+                    images=image,
+                    captions=current_seq,
+                    num_devices=num_devices,
+                    strategy='encoder_decoder'  # FORCE encoder-decoder split
+                )
+                
+                logits = result.get('final_logits')
+                if logits is None:
+                    print("Warning: No logits generated, stopping generation")
+                    break
+                
+                # Sample next token
+                probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
+                next_token = torch.multinomial(probs, 1)
+                generated[:, i] = next_token.squeeze(1)
+                
+                # Stop if EOS token
+                if next_token.item() == 2:  # EOS token
+                    break
             
-            logits = result.get('final_logits')
-            if logits is None:
-                print("Warning: No logits generated, stopping generation")
-                break
+            return generated[0].tolist()
             
-            # Sample next token
-            probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
-            next_token = torch.multinomial(probs, 1)
-            generated[:, i] = next_token.squeeze(1)
+        except Exception as e:
+            print(f"❌ Caption generation failed with encoder-decoder strategy: {e}")
+            print("🔄 Falling back to single-device inference...")
             
-            # Stop if EOS token
-            if next_token.item() == 2:  # EOS token
-                break
+            # Fallback to single-device inference
+            with torch.no_grad():
+                generated = torch.zeros(batch_size, max_length, dtype=torch.long, device=device)
+                generated[:, 0] = 1  # BOS token
+                
+                for i in range(1, max_length):
+                    current_seq = generated[:, :i]
+                    logits = self.model(image, current_seq)
+                    
+                    if logits is None:
+                        break
+                    
+                    probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
+                    next_token = torch.multinomial(probs, 1)
+                    generated[:, i] = next_token.squeeze(1)
+                    
+                    if next_token.item() == 2:  # EOS token
+                        break
+                
+                return generated[0].tolist()
+                
+        finally:
+            # Restore original strategy
+            self.splitting_strategy = original_strategy
+            print(f"🔄 Caption generation: Strategy restored to '{original_strategy}'")
+    
+    def benchmark_strategies(self, test_images: torch.Tensor, 
+                           test_captions: torch.Tensor = None) -> Dict[str, Any]:
+        """Benchmark different splitting strategies"""
+        strategies = ['even_split', 'capability_weighted', 'bandwidth_aware', 'encoder_decoder']
+        results = {}
         
-        return generated[0].tolist()
-
+        print("Benchmarking splitting strategies...")
+        
+        for strategy in strategies:
+            print(f"\nTesting {strategy}...")
+            
+            try:
+                start_time = time.time()
+                result = self.inference(test_images, test_captions, strategy=strategy)
+                end_time = time.time()
+                
+                results[strategy] = {
+                    'total_time': end_time - start_time,
+                    'device_count': result.get('metrics', {}).get('device_count', 0),
+                    'success': True,
+                    'metrics': result.get('metrics', {})
+                }
+                
+                print(f"  ✓ Completed in {end_time - start_time:.3f}s with {result.get('metrics', {}).get('device_count', 0)} devices")
+                
+            except Exception as e:
+                print(f"  ✗ Failed: {str(e)}")
+                results[strategy] = {
+                    'total_time': float('inf'),
+                    'success': False,
+                    'error': str(e)
+                }
+        
+        # Find best strategy
+        successful_results = {k: v for k, v in results.items() if v.get('success', False)}
+        if successful_results:
+            best_strategy = min(successful_results.keys(), 
+                              key=lambda k: successful_results[k]['total_time'])
+            print(f"\nBest strategy: {best_strategy} ({successful_results[best_strategy]['total_time']:.3f}s)")
+        
+        return results
+    
+    def get_performance_stats(self) -> Dict[str, Any]:
+        """Get performance statistics"""
+        if not self.performance_history:
+            return {'message': 'No inference history available'}
+        
+        recent_history = self.performance_history[-50:]  # Last 50 inferences
+        
+        times = [record['total_time'] for record in recent_history]
+        device_counts = [record['split_config']['total_devices'] for record in recent_history]
+        
+        stats = {
+            'total_inferences': len(self.performance_history),
+            'recent_avg_time': np.mean(times) if times else 0,
+            'recent_std_time': np.std(times) if times else 0,
+            'avg_devices_used': np.mean(device_counts) if device_counts else 0,
+            'fastest_time': min(times) if times else 0,
+            'slowest_time': max(times) if times else 0,
+            'registered_devices': len(self.available_devices),
+            'strategies_used': list(set(record['split_config']['strategy'] for record in recent_history))
+        }
+        
+        return stats

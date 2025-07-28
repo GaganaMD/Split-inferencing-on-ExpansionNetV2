@@ -38,7 +38,7 @@ def main():
     print_split_config(config)
     
     print(f"\n4. Encoder-Decoder Split:")
-    config = splitter.encoder_decoder_split(3)
+    config = splitter.encoder_decoder_split(4)
     print_split_config(config)
     
     # Layer complexity analysis
