@@ -72,6 +72,10 @@ class InferenceExpansionNet(nn.Module):
         self.output_projection = nn.Linear(model_dim, vocab_size)
         self.pos_encoding = PositionalEncoding(model_dim, max_seq_len)
         self.token_embedding = nn.Embedding(vocab_size, model_dim)
+    @property
+    def total_layers(self):
+        return self.get_total_layers()
+
         
     def _build_visual_encoder(self):
         """Fixed visual feature extraction"""
@@ -194,6 +198,7 @@ class InferenceExpansionNet(nn.Module):
         if assignment.layer_start < self.N_enc:
             encoder_start = max(0, assignment.layer_start)
             encoder_end = min(self.N_enc, assignment.layer_end + 1)
+            encoder_input = input_data.get('encoder_input') or input_data.get('visual_features')
             
             encoder_input = input_data.get('encoder_input', input_data.get('visual_features'))
             if encoder_input is not None:
